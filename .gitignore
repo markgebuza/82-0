@@ -1,0 +1,5 @@
+__pycache__
+.vscode
+players_scores.db
+results_82_0.json
+train_output.txt
