@@ -17,13 +17,14 @@ with open("results_82_0.json") as file:
 
 l = linear_reg(features, output)
 
+out_file = open("train_output.txt", "a+", encoding="utf-8")
+
+lines = out_file.readlines()
+l.params = lines[-1] if lines else [0,0,0,0,0,0]
+
 l.stochastic_gd(alpha=0.005, max_iters=100)
 
-out_file = open("train_output.txt", "a", encoding="utf-8")
-def log(msg):
-    out_file.write(f"{msg}\n")
-
-log(l.params)
+out_file.write(f"{l.params}\n")
 
 viable_scores = []
 viable_player_team_era = []

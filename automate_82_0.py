@@ -145,14 +145,9 @@ def first_eligible_card(page, empties):
             return i, name, team, era, eligible
     return None
 
-def best_fit(page, empties):
+def best_fit(page, team, era, empties):
 
     page.locator(CARD_SEL).first.wait_for(state="visible", timeout=ACTION_TIMEOUT)
-
-    p = player_card(page, 0)
-
-    team = p[3]
-    era = p[4]
 
     connection = sqlite3.connect("players_scores.db")
 
@@ -290,11 +285,77 @@ def _spin(page):
     raise last
 
 
+def _best_eligible_score(c, team, era, empties):
+    """Highest OVR among players for (team, era) that can fill one of the open slots,
+    read straight from the DB. 0 if none fits."""
+    c.execute("SELECT positions, score FROM scores WHERE team=? AND era=? ORDER BY score DESC",
+              (team, era))
+    for positions_json, score in c.fetchall():
+        if any(p in empties for p in json.loads(positions_json)):
+            return score
+    return 0.0
+
+
+def _axis_reroll_value(c, axis, team, era, empties):
+    """Average best-eligible OVR over every other valid value on `axis`: other teams in
+    the same era, or other eras for the same team. Combos that never existed simply
+    aren't in the DB, so they drop out of the average."""
+    if axis == "team":
+        c.execute("SELECT DISTINCT team FROM scores WHERE era=? AND team!=?", (era, team))
+        cands = [(r[0], era) for r in c.fetchall()]
+    else:
+        c.execute("SELECT DISTINCT era FROM scores WHERE team=? AND era!=?", (team, era))
+        cands = [(team, r[0]) for r in c.fetchall()]
+    scores = [_best_eligible_score(c, t, e, empties) for t, e in cands]
+    return sum(scores) / len(scores) if scores else 0.0
+
+
+def _reroll(page, axis):
+    """Click the refresh icon button sitting beside the 'team'/'era' label. Only the
+    label's own button or an adjacent sibling counts — never a page-wide search, which
+    would wander back to the restart-game button."""
+    label = page.get_by_text(re.compile(rf"^{axis}$", re.I)).first
+    for xp in ("xpath=ancestor-or-self::button[1]",    # refresh icon + word share one button
+               "xpath=preceding-sibling::button[1]",   # <button/> <span>team</span>
+               "xpath=following-sibling::button[1]",
+               "xpath=../button[1]"):                   # button is a sibling under the same row
+        btn = label.locator(xp)
+        if btn.count():
+            btn.first.click(timeout=ACTION_TIMEOUT)
+            return
+    raise RuntimeError(f"could not find reroll control for {axis}")
+
+
+def consider_rerolls(page, team, era, empties, rerolls):
+    """Spend remaining team/era rerolls while a reroll's expected OVR beats the current
+    draw. Rerolls land on a random other value, so the decision is made on the average
+    OVR across possible outcomes. Returns the (possibly new) team/era."""
+    connection = sqlite3.connect("players_scores.db")
+    c = connection.cursor()
+    try:
+        while True:
+            current = _best_eligible_score(c, team, era, empties)
+            options = [(axis, _axis_reroll_value(c, axis, team, era, empties))
+                       for axis in ("team", "era") if rerolls[axis]]
+            axis, value = max(options, key=lambda o: o[1], default=(None, 0.0))
+            if axis is None or value <= current:
+                break
+            _reroll(page, axis)
+            rerolls[axis] = False
+            time.sleep(2.3)
+            p = player_card(page, 0)
+            team, era = p[3], p[4]
+    finally:
+        connection.close()
+    return team, era
+
+
 def play_one_game(page):
     """Build a full lineup by taking the first player each round. Returns lineup dict."""
     lineup = {}
     occupant = {}   # court slot -> the occupying player's eligible positions
     slots = None
+    rerolls = {"team": True, "era": True}   # one reroll per axis for the whole game
     while True:
         rnd = round_number(page)
         if rnd is None:
@@ -307,7 +368,15 @@ def play_one_game(page):
         empties = empty_slots(list(occupant.values()))
         if not empties:
             return lineup
-        picked = best_fit(page, empties)
+
+        p = player_card(page, 0)
+
+        team = p[3]
+        era = p[4]
+
+        team, era = consider_rerolls(page, team, era, empties, rerolls)
+
+        picked = best_fit(page, team, era, empties)
         if picked is None:
             raise RuntimeError(f"round {rnd}: no player on screen can fill {empties}")
         index, name, team, era, eligible, positions = picked
