@@ -84,14 +84,35 @@ def round_number(page):
     return int(m.group(1)) if m else None
 
 
-def empty_slots(page):
-    """Court slots still showing a position label (PG/SG/…) are unfilled."""
-    return page.evaluate(
-        """(sel) => [...document.querySelectorAll(sel)]
-            .map(b => (b.textContent || '').trim())
-            .filter(t => /^(PG|SG|SF|PF|C)$/.test(t))""",
-        SLOT_SEL,
-    )
+def _arrange(occupant, forbid):
+    """Assign every already-placed player to a distinct eligible position other than
+    `forbid`, freeing that slot. `occupant` maps a player key (its current slot, or
+    just an index) to that player's eligible positions. Returns {key: position} or
+    None if impossible. Bipartite matching via Kuhn's algorithm."""
+    allowed = [p for p in POSITIONS if p != forbid]
+    match = {}  # position -> player key
+
+    def assign(key, seen):
+        for pos in sorted(occupant[key], key=POSITIONS.index):   # guards before centers
+            if pos in allowed and pos not in seen:
+                seen.add(pos)
+                if pos not in match or assign(match[pos], seen):
+                    match[pos] = key
+                    return True
+        return False
+
+    for key in occupant:
+        if not assign(key, set()):
+            return None
+    return {key: pos for pos, key in match.items()}
+
+
+def empty_slots(placed):
+    """A slot is empty unless it's genuinely full: it counts as open whenever the
+    already-placed players (`placed` = list of each player's eligible positions)
+    can be rearranged among their other positions to free it."""
+    occupant = dict(enumerate(placed))
+    return [p for p in POSITIONS if _arrange(occupant, p) is not None]
 
 
 def player_card(page, index=0):
@@ -124,20 +145,133 @@ def first_eligible_card(page, empties):
             return i, name, team, era, eligible
     return None
 
-def best_fit(page, era, team, empties):
+def best_fit(page, empties):
+
+    page.locator(CARD_SEL).first.wait_for(state="visible", timeout=ACTION_TIMEOUT)
+
+    p = player_card(page, 0)
+
+    team = p[3]
+    era = p[4]
 
     connection = sqlite3.connect("players_scores.db")
 
     c = connection.cursor()
 
-    c.execute("SELECT player from scores where")
+    count = page.locator(CARD_SEL).count()
+
+    # Map each on-screen player name to its card index so we can return the index
+    # the game actually uses for clicking, not the DB query offset.
+    card_index_by_name = {player_card(page, i)[1]: i for i in range(count)}
+
+    offset = 0
+
+    while True:
+
+        c.execute("SELECT player, positions from scores where team = ? and era = ? limit 1 offset ?", (team, era, offset))
+
+        player_pos = c.fetchone()
+
+        if player_pos is None:
+            break
+
+        positions = json.loads(player_pos[1])
+        # Prefer high-priority slots: guards, then forwards, then centers.
+        eligible = sorted((p for p in positions if p in empties), key=POSITIONS.index)
+
+        card_index = card_index_by_name.get(player_pos[0])
+
+        if eligible and card_index is not None:
+            connection.close()
+            return card_index, player_pos[0], team, era, eligible, positions
+
+        offset += 1
+    connection.close()
+    return None
+
 
     
 
-def _slot_button(page, slot):
-    """Locate the court slot button whose label is exactly `slot` (exact match so
-    the single-letter 'C' doesn't substring-match other slots)."""
-    return page.locator(SLOT_SEL).filter(has_text=re.compile(rf"^{slot}$")).first
+def _slot_index_map(page):
+    """Map each court position to its slot-button DOM index, read from the empty
+    board. Captured while all slots show their position label so it stays valid once
+    they fill with players (a filled slot's button no longer shows the label)."""
+    page.locator(SLOT_SEL).first.wait_for(state="visible", timeout=ACTION_TIMEOUT)
+    labels = page.evaluate(
+        "(sel)=>[...document.querySelectorAll(sel)].map(b=>(b.textContent||'').trim())",
+        SLOT_SEL,
+    )
+    return {lab: i for i, lab in enumerate(labels) if lab in POSITIONS}
+
+
+def _click_slot(page, slots, pos):
+    page.locator(SLOT_SEL).nth(slots[pos]).click(timeout=ACTION_TIMEOUT)
+
+
+def _drag_slot(page, slots, src, dst):
+    """Drag the player in slot `src` onto the empty slot `dst`. The board uses native
+    HTML5 drag-and-drop (draggable='true'), which Chromium does not fire from synthetic
+    mouse moves, so dispatch the drag events directly with a shared DataTransfer."""
+    source = page.locator(SLOT_SEL).nth(slots[src])
+    target = page.locator(SLOT_SEL).nth(slots[dst])
+    source.scroll_into_view_if_needed()
+    dt = page.evaluate_handle("() => new DataTransfer()")
+    source.dispatch_event("dragstart", {"dataTransfer": dt})
+    target.dispatch_event("dragenter", {"dataTransfer": dt})
+    target.dispatch_event("dragover", {"dataTransfer": dt})
+    target.dispatch_event("drop", {"dataTransfer": dt})
+    source.dispatch_event("dragend", {"dataTransfer": dt})
+
+
+def _plan_moves(arrangement):
+    """Turn a target {current_slot: target_slot} mapping into an ordered list of
+    (from, to) single-player moves, each dropping a player onto an empty slot. Empty
+    slots act as buffers to resolve cycles (15-puzzle style)."""
+    cur = {k: k for k in arrangement}   # player id (starting slot) -> current slot
+    moves = []
+    occupied = lambda: set(cur.values())
+    while any(cur[k] != arrangement[k] for k in arrangement):
+        for k in arrangement:                       # a player whose target is open
+            if cur[k] != arrangement[k] and arrangement[k] not in occupied():
+                moves.append((cur[k], arrangement[k]))
+                cur[k] = arrangement[k]
+                break
+        else:                                        # cycle: park one player in a buffer
+            buf = next(p for p in POSITIONS if p not in occupied())
+            for k in arrangement:
+                if cur[k] != arrangement[k]:
+                    moves.append((cur[k], buf))
+                    cur[k] = buf
+                    break
+    return moves
+
+
+def _slot_is_empty(page, slots, pos):
+    """An empty slot shows its position label; a filled one shows the player."""
+    return page.locator(SLOT_SEL).nth(slots[pos]).inner_text(timeout=2000).strip() == pos
+
+
+def _free_slot(page, slots, occupant, lineup, target):
+    """Rearrange the already-placed players so `target` becomes empty by dragging each
+    player from its slot onto an empty one. Mutates occupant/lineup to track the new
+    board. False if target can't be freed or a drag won't land."""
+    if target not in occupant:
+        return True
+    arrangement = _arrange(occupant, target)
+    if arrangement is None:
+        return False
+    for src, dst in _plan_moves(arrangement):
+        for _ in range(3):
+            _drag_slot(page, slots, src, dst)
+            time.sleep(0.6)
+            if _slot_is_empty(page, slots, src):   # drag landed: src vacated
+                break
+        else:
+            return False   # drag never landed — don't desync occupant from the board
+        occupant[dst] = occupant.pop(src)
+        if src in lineup:
+            lineup[dst] = lineup.pop(src)
+    return True
 
 
 def _spin(page):
@@ -159,42 +293,50 @@ def _spin(page):
 def play_one_game(page):
     """Build a full lineup by taking the first player each round. Returns lineup dict."""
     lineup = {}
+    occupant = {}   # court slot -> the occupying player's eligible positions
+    slots = None
     while True:
         rnd = round_number(page)
         if rnd is None:
             break
         _spin(page)
         time.sleep(2.3)
+        if slots is None:   # capture the slot layout on the still-empty round-1 board
+            slots = _slot_index_map(page)
 
-        empties = empty_slots(page)
+        empties = empty_slots(list(occupant.values()))
         if not empties:
             return lineup
-        picked = first_eligible_card(page, empties)
+        picked = best_fit(page, empties)
         if picked is None:
             raise RuntimeError(f"round {rnd}: no player on screen can fill {empties}")
-        index, name, team, era, eligible = picked
+        index, name, team, era, eligible, positions = picked
 
-        # A click occasionally misses, leaving the round unchanged (and no SPIN).
-        # Retry across every slot the player is eligible for until one advances
-        # the round — a single slot's click can silently miss.
-        placed = False
+        # An eligible slot may be physically occupied but freeable: rearrange the
+        # placed players to vacate it, then click the card in. A click occasionally
+        # misses (round unchanged, no SPIN), so retry the placement.
+        placed_ok = False
         for slot in eligible:
+            if not _free_slot(page, slots, occupant, lineup, slot):
+                continue
             for _ in range(3):
                 try:
                     player_card(page, index)[0].click()
                     time.sleep(0.6)
-                    _slot_button(page, slot).click(timeout=ACTION_TIMEOUT)
+                    _click_slot(page, slots, slot)
                     time.sleep(1.0)
                     if round_number(page) != rnd:   # advanced to next round / result screen
                         lineup[slot] = f"{name} ({team},{era})"
-                        placed = True
+                        occupant[slot] = positions
+                        placed_ok = True
                         break
                 except Exception:
                     time.sleep(1)
-            if placed:
+            if placed_ok:
                 break
-        if not placed:
+        if not placed_ok:
             raise RuntimeError(f"round {rnd}: could not place {name} in {eligible}")
+    time.sleep(5)
     return lineup
 
 
